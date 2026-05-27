@@ -58,13 +58,17 @@ router.get('/', async (req, res) => {
 
   const conditions = [];
   const params = [];
+  const categoryJoin = category
+    ? `JOIN product_categories pc ON pc.product_id = p.id
+       JOIN categories c ON c.id = pc.category_id`
+    : '';
 
   if (available === 'true') conditions.push('p.quantity > 0');
   conditions.push(`p.best_before IS NULL OR p.best_before >= CURRENT_DATE`);
   const now = db.isPostgres ? 'NOW()' : "datetime('now')";
   conditions.push(`(p.available_from IS NULL OR p.available_from <= ${now})`);
   conditions.push(`(p.available_until IS NULL OR p.available_until >= ${now})`);
-  if (category) { conditions.push(`p.category = $${params.length + 1}`); params.push(category); }
+  if (category) { conditions.push(`c.slug = $${params.length + 1}`); params.push(category); }
   if (minPrice !== undefined) { const min = parseFloat(minPrice); if (!Number.isNaN(min)) { conditions.push(`p.price >= $${params.length + 1}`); params.push(min); } }
   if (maxPrice !== undefined) { const max = parseFloat(maxPrice); if (!Number.isNaN(max)) { conditions.push(`p.price <= $${params.length + 1}`); params.push(max); } }
   if (seller) { conditions.push(`u.name ${db.isPostgres ? 'ILIKE' : 'LIKE'} $${params.length + 1}`); params.push(`%${seller}%`); }
@@ -87,7 +91,7 @@ router.get('/', async (req, res) => {
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const { rows: countRows } = await db.query(
-    `SELECT COUNT(*) as count FROM products p JOIN users u ON p.farmer_id = u.id ${where}`,
+    `SELECT COUNT(*) as count FROM products p JOIN users u ON p.farmer_id = u.id ${categoryJoin} ${where}`,
     params
   );
   const total = parseInt(countRows[0].count);
@@ -107,6 +111,7 @@ router.get('/', async (req, res) => {
      FROM products p
      JOIN users u ON p.farmer_id = u.id
      LEFT JOIN reviews r ON r.product_id = p.id
+     ${categoryJoin}
      ${popularJoin}
      ${where}
      GROUP BY p.id, u.name, u.latitude, u.longitude, u.farm_address${sortKey === 'popular' ? ', oc.order_count' : ''}

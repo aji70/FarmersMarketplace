@@ -22,6 +22,7 @@ const { errorHandler } = require('./middleware/error');
 const { notFoundHandler } = require('./middleware/error');
 const { sanitizeResponse } = require('./middleware/sanitize');
 const requestLogger = require('./middleware/requestLogger');
+const categoriesRouter = require('./routes/categories');
 
 const app = express();
 
@@ -90,6 +91,7 @@ app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/uploads/videos', express.static(path.join(__dirname, '../uploads/videos')));
 
 app.get('/api/csrf-token', csrfTokenHandler);
+app.use('/api/categories', categoriesRouter);
 
 // Interactive API documentation
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
