@@ -50,7 +50,14 @@ async function getTierPrice(productId, quantity) {
 
 function isFlashSaleActive(product) {
   if (!product?.flash_sale_price || !product?.flash_sale_ends_at) return false;
-  return new Date(product.flash_sale_ends_at).getTime() > Date.now();
+  const now = Date.now();
+  const endsAt = new Date(product.flash_sale_ends_at).getTime();
+  if (endsAt <= now) return false;
+  if (product.flash_sale_starts_at) {
+    const startsAt = new Date(product.flash_sale_starts_at).getTime();
+    if (startsAt > now) return false;
+  }
+  return true;
 }
 
 async function getEffectiveUnitPrice(product, productId, quantity) {
@@ -109,6 +116,17 @@ router.post('/', auth, validate.order, async (req, res) => {
   const product = prodRows[0];
   if (!product) return err(res, 404, 'Product not found', 'not_found');
 
+  // Flash sale time window validation (server time is the source of truth)
+  if (product.flash_sale_price && product.flash_sale_ends_at) {
+    const now = Date.now();
+    if (product.flash_sale_starts_at && new Date(product.flash_sale_starts_at).getTime() > now) {
+      return err(res, 422, 'Flash sale has not started yet', 'flash_sale_not_started');
+    }
+    if (new Date(product.flash_sale_ends_at).getTime() <= now) {
+      return err(res, 422, 'Flash sale has ended', 'flash_sale_ended');
+    }
+  }
+
   const { rows: buyerRows } = await db.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
   const buyer = buyerRows[0];
 
@@ -130,14 +148,6 @@ router.post('/', auth, validate.order, async (req, res) => {
   if (quantity < moq) {
     return err(res, 400, `Minimum order is ${moq} units`, 'below_moq');
   }
-
-  const { rows: bRows } = await db.query(
-    'SELECT id, name, email, stellar_public_key, stellar_secret_key, referred_by, referral_bonus_sent FROM users WHERE id = $1',
-    [req.user.id]
-  );
-
-  // buyer already fetched above; use bRows for the more detailed version
-  const buyerDetailed = bRows[0] || buyer;
 
   let subtotal;
   if (product.pricing_type === 'weight') {
@@ -167,50 +177,14 @@ router.post('/', auth, validate.order, async (req, res) => {
       ? parseFloat((subtotal * appliedCoupon.discount_value / 100).toFixed(7))
       : Math.min(parseFloat(appliedCoupon.discount_value), subtotal);
   }
-  // 2. Validate Pricing & Calculate Total
-  let unitPrice = 0;
+  // 2. Validate Pricing (PWYW / donation)
   if (product.pricing_model === 'pwyw') {
     if (!custom_price || custom_price < product.min_price) {
       return err(res, 422, `Offered price is below the minimum of ${product.min_price} XLM`, 'below_min_price');
     }
-    unitPrice = parseFloat(custom_price);
   } else if (product.pricing_model === 'donation') {
     if (!custom_price || custom_price <= 0) {
       return err(res, 400, 'Donation amount must be positive', 'validation_error');
-    }
-    unitPrice = parseFloat(custom_price);
-  } else if (product.pricing_type === 'weight') {
-    if (!weight) return err(res, 400, 'Weight is required', 'validation_error');
-    unitPrice = product.price; // Price is per unit of weight
-  } else {
-    unitPrice = await getEffectiveUnitPrice(product, product_id, quantity);
-  }
-
-  const subtotal = product.pricing_type === 'weight' ? unitPrice * weight : unitPrice * quantity;
-  let discount = 0;
-  let appliedCoupon = null;
-
-  if (coupon_code && product.pricing_model === 'fixed') { // Coupons usually apply to fixed price
-    const result = await db.query('SELECT * FROM coupons WHERE code = $1 AND farmer_id = $2', [coupon_code, product.farmer_id]);
-    if (result.rows[0]) {
-      appliedCoupon = result.rows[0];
-      discount = calcDiscount(appliedCoupon, subtotal);
-  const { rows: buyerRows } = await db.query(
-    'SELECT id, name, email, stellar_public_key, stellar_secret_key, referred_by, referral_bonus_sent FROM users WHERE id = $1',
-    [req.user.id]
-  );
-  const buyer = buyerRows[0];
-
-  const unitPrice = await getEffectiveUnitPrice(product, product_id, quantity);
-  const subtotal = unitPrice * quantity;
-  let discount = 0;
-  let appliedCoupon = null;
-
-  if (coupon_code) {
-    const { coupon, error, code: errCode } = resolveCoupon(coupon_code, product.farmer_id, req.user.id);
-    if (!error) {
-       discount = calcDiscount(coupon, subtotal);
-       appliedCoupon = coupon;
     }
   }
 
@@ -264,7 +238,7 @@ router.post('/', auth, validate.order, async (req, res) => {
   );
   const orderId = orderRows[0].id;
 
-  if (payment_method === 'sep7') {
+  if (req.body.payment_method === 'sep7') {
     if (appliedCoupon) {
       db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(appliedCoupon.id);
       db.prepare('INSERT INTO coupon_uses (coupon_id, user_id) VALUES (?, ?)').run(appliedCoupon.id, req.user.id);
@@ -468,72 +442,6 @@ router.post('/', auth, validate.order, async (req, res) => {
     const errorData = { success: false, message: 'Payment failed: ' + e.message, code: 'payment_failed', orderId };
     if (idempotencyKey) await cacheResponse(idempotencyKey, errorData);
     return res.status(402).json(errorData);
-
-    await db.query('UPDATE orders SET status = $1, stellar_tx_hash = $2 WHERE id = $3', ['paid', txHash, orderId]);
-
-    // Referral bonus
-    if (buyer.referred_by && buyer.referral_bonus_sent === 0) {
-      const { rows: refRows } = await db.query('SELECT stellar_public_key FROM users WHERE id = $1', [buyer.referred_by]);
-      const treasury = process.env.MARKETPLACE_TREASURY_SECRET;
-      if (refRows[0] && treasury) {
-        sendPayment({ senderSecret: treasury, receiverPublicKey: refRows[0].stellar_public_key, amount: 1.0, memo: `Ref Bonus: ${buyer.name}`.slice(0, 28) })
-          .then(() => db.query('UPDATE users SET referral_bonus_sent = 1 WHERE id = $1', [buyer.id]))
-          .catch(e => console.error('[Ref] Bonus fail:', e.message));
-      }
-    }
-
-    // Rewards
-    const rewardAmt = Math.floor(totalPrice);
-    if (rewardAmt > 0) mintRewardTokens(buyer.stellar_public_key, rewardAmt).catch(e => console.error('[Rewards] fail:', e.message));
-
-    // Notifications
-    sendOrderEmails({ order: { id: orderId, quantity, total_price: totalPrice, stellar_tx_hash: txHash }, product, buyer, farmer }).catch(e => console.error('[Mail] fail:', e.message));
-    sendPushToUser(farmer.id, { title: 'New order', body: `${buyer.name} ordered ${product.name}`, url: '/dashboard' }).catch(e => console.error('[Push] fail:', e.message));
-
-    // Cleanup & Cache
-    if (appliedCoupon) await db.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [appliedCoupon.id]);
-          .catch(e => logger.error('[Referral] Failed to send bonus:', { error: e.message }));
-      }
-    }
-
-    const { rows: fRows } = await db.query('SELECT id, name, email, stellar_public_key FROM users WHERE id = $1', [product.farmer_id]);
-    sendOrderEmails({ order: { id: orderId, quantity, total_price: totalPrice, stellar_tx_hash: txHash }, product, buyer, farmer: fRows[0] })
-      .catch(e => logger.error('Email notification failed:', { error: e.message }));
-
-    // Mint reward tokens (1 token per 1 XLM spent)
-    const rewardAmount = Math.floor(totalPrice);
-    if (rewardAmount > 0 && buyer.stellar_public_key) {
-      mintRewardTokens(buyer.stellar_public_key, rewardAmount)
-        .catch(e => logger.error('[Rewards] Failed to mint tokens:', { error: e.message }));
-    }
-
-    // Low-stock check
-    const { rows: updRows } = await db.query('SELECT quantity, low_stock_threshold, low_stock_alerted FROM products WHERE id = $1', [product_id]);
-    const updated = updRows[0];
-    // Only send alert if threshold is set (not null/0) and stock is at or below threshold
-    if (updated && updated.low_stock_threshold && updated.low_stock_threshold > 0 && updated.quantity <= updated.low_stock_threshold && !updated.low_stock_alerted) {
-      await db.query('UPDATE products SET low_stock_alerted = 1 WHERE id = $1', [product_id]);
-      sendLowStockAlert({ product: { ...product, quantity: updated.quantity }, farmer: fRows[0] })
-        .catch(e => logger.error('Low-stock alert failed:', { error: e.message }));
-    }
-       await db.query('UPDATE coupons SET used_count = used_count + 1 WHERE id = $1', [appliedCoupon.id]);
-    }
-
-    const { rows: fRows } = await db.query('SELECT id, name, email, stellar_public_key FROM users WHERE id = $1', [product.farmer_id]);
-    const farmer = fRows[0];
-
-    sendOrderEmails({ order: { id: orderId, quantity, total_price: totalPrice, stellar_tx_hash: txHash }, product, buyer, farmer })
-      .catch(e => console.error('Email failed:', e.message));
-
-    const responseData = { success: true, orderId, status: 'paid', txHash, totalPrice };
-    if (idempotencyKey) cacheResponse(idempotencyKey, responseData);
-    res.json(responseData);
-
-  } catch (e) {
-    // Rollback stock and update order status on payment failure
-    await db.query('UPDATE orders SET status=$1 WHERE id=$2', ['failed', orderId]);
-    await db.query('UPDATE products SET quantity = quantity + $1 WHERE id = $2', [quantity, product_id]);
-    res.status(402).json({ success: false, message: 'Payment failed: ' + e.message, code: 'payment_failed', orderId });
   }
 });
 
@@ -690,7 +598,6 @@ router.patch('/:id/status', auth, validate.updateOrderStatus, async (req, res) =
     title: 'Order status updated',
     body: `Order #${order.id} is now ${status}`,
     url: '/orders',
-  }).catch((pushErr) => console.error('Push notification failed:', pushErr.message));
   }).catch((pushErr) => logger.error('Push notification failed:', { error: pushErr.message }));
 
   res.json({ success: true, message: 'Order status updated' });
@@ -740,13 +647,10 @@ router.post('/:id/refund', auth, async (req, res) => {
   try {
     const result = await invokeEscrowContract({ action: 'refund', senderSecret: uRows[0].stellar_secret_key, orderId: Number(order.id) });
     await db.query('UPDATE orders SET escrow_status = $1, stellar_tx_hash = $2 WHERE id = $3', ['refunded', result.txHash, order.id]);
-    res.json({ success: true, txHash: result.txHash });
-  } catch (e) { res.status(402).json({ success: false, message: e.message }); }
     return res.json({ success: true, txHash: result.txHash });
   } catch (e) {
     return res.status(402).json({ success: false, message: 'Refund failed: ' + e.message, code: 'refund_failed' });
   }
-  res.json({ success: true, data, total, page, limit });
 });
 
 // GET /api/orders/:id/receipt
