@@ -593,3 +593,89 @@ if (usersRow && !usersRow.sql.includes("'admin'")) {
 }
 
 module.exports = db;
+const USE_POSTGRES = !!process.env.DATABASE_URL;
+
+let db;
+
+if (USE_POSTGRES) {
+  const pg = require('./postgres');
+  // In Postgres mode, the pool is exported directly.
+  // The migration runner is usually called from server.js or migrate.js.
+  db = pg;
+  db.isPostgres = true;
+} else {
+  let sqlite;
+  try {
+    sqlite = new Database(path.join(__dirname, '../../market.db'));
+  } catch (err) {
+    console.error('[DB] Failed to open SQLite database:', err.message);
+    process.exit(1);
+  }
+
+  // Unified adapter for SQLite to match pg pool interface
+  db = {
+    async query(text, params = []) {
+      // Convert $1, $2, ... placeholders to ? for SQLite
+      let i = 0;
+      const sqliteText = text.replace(/\$\d+/g, () => {
+        i++;
+        return '?';
+      });
+
+      try {
+        if (/^\s*(SELECT|WITH)/i.test(sqliteText)) {
+          const rows = sqlite.prepare(sqliteText).all(...params);
+          return { rows, rowCount: rows.length };
+        }
+        const info = sqlite.prepare(sqliteText).run(...params);
+        // Better-sqlite3 doesn't support RETURNING easily without polyfills,
+        // but it provides lastInsertRowid.
+        const returningMatch = text.match(/RETURNING\s+(\w+)/i);
+        const rows = returningMatch ? [{ [returningMatch[1]]: info.lastInsertRowid }] : [];
+        return { rows, rowCount: info.changes };
+      } catch (err) {
+        console.error('[DB] SQLite error:', err.message, '| SQL:', sqliteText);
+        throw err;
+      }
+    },
+    // For transactions in SQLite
+    transaction(fn) {
+      return sqlite.transaction(fn);
+    },
+    prepare(sql) {
+      return sqlite.prepare(sql);
+    },
+  };
+
+  const { runMigrations } = require('./migrationRunner');
+  runMigrations(db).catch((err) => {
+    console.error('[DB] Migration failed:', err.message);
+    process.exit(1);
+  });
+
+// Migrate users role CHECK constraint to include 'admin' if needed
+const usersRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+if (usersRow && !usersRow.sql.includes("'admin'")) {
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    CREATE TABLE users_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('farmer', 'buyer', 'admin')),
+      stellar_public_key TEXT,
+      stellar_secret_key TEXT,
+      farm_lat REAL,
+      farm_lng REAL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO users_new (id, name, email, password, role, stellar_public_key, stellar_secret_key, created_at)
+      SELECT id, name, email, password, role, stellar_public_key, stellar_secret_key, created_at FROM users;
+    DROP TABLE users;
+    ALTER TABLE users_new RENAME TO users;
+  `);
+  db.pragma('foreign_keys = ON');
+}
+
+module.exports = db;
