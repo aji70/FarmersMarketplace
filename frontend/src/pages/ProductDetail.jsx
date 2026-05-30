@@ -5,6 +5,7 @@ import { useAuth } from '../context/AuthContext';
 import { useFavorites } from '../context/FavoritesContext';
 import { getStellarErrorMessage } from '../utils/stellarErrors';
 import { getErrorMessage } from '../utils/errorMessages';
+import { showToast } from '../utils/toast';
 import { useXlmRate } from '../utils/useXlmRate';
 import StarRating from '../components/StarRating';
 import Spinner from '../components/Spinner';
@@ -427,7 +428,9 @@ export default function ProductDetail() {
       });
       setResult({ ...res, escrow: useEscrow });
     } catch (e) {
-      setError(getStellarErrorMessage(e) || getErrorMessage(e));
+      const msg = getStellarErrorMessage(e) || getErrorMessage(e);
+      setError(msg);
+      showToast(msg, 'error');
     } finally {
       setLoading(false);
     }
