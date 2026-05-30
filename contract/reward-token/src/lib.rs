@@ -218,8 +218,8 @@ impl RewardToken {
             panic!("insufficient balance");
         }
         let to_balance = Self::balance(env.clone(), to.clone());
-        env.storage().persistent().set(&(BALANCE, from.clone()), &(from_balance - amount));
-        env.storage().persistent().set(&(BALANCE, to.clone()), &(to_balance + amount));
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(from_balance - amount));
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_balance + amount));
 
         env.events().publish(("transfer_from", spender, from, to), amount);
     }
