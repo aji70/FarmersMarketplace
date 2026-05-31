@@ -68,6 +68,17 @@ router.post('/', auth, async (req, res) => {
   if (req.user.role !== 'buyer')
     return res.status(403).json({ error: 'Only buyers can place orders' });
 
+function isFlashSaleActive(product) {
+  if (!product?.flash_sale_price || !product?.flash_sale_ends_at) return false;
+  const now = Date.now();
+  const endsAt = new Date(product.flash_sale_ends_at).getTime();
+  if (endsAt <= now) return false;
+  if (product.flash_sale_starts_at) {
+    const startsAt = new Date(product.flash_sale_starts_at).getTime();
+    if (startsAt > now) return false;
+  }
+  return true;
+}
   const { product_id, quantity, delivery_lat, delivery_lng } = req.body;
   if (!product_id || !quantity)
     return res.status(400).json({ error: 'product_id and quantity required' });
@@ -128,6 +139,17 @@ router.post('/', auth, validate.order, async (req, res) => {
   const product = prodRows[0];
   if (!product) return err(res, 404, 'Product not found', 'not_found');
 
+  // Flash sale time window validation (server time is the source of truth)
+  if (product.flash_sale_price && product.flash_sale_ends_at) {
+    const now = Date.now();
+    if (product.flash_sale_starts_at && new Date(product.flash_sale_starts_at).getTime() > now) {
+      return err(res, 422, 'Flash sale has not started yet', 'flash_sale_not_started');
+    }
+    if (new Date(product.flash_sale_ends_at).getTime() <= now) {
+      return err(res, 422, 'Flash sale has ended', 'flash_sale_ended');
+    }
+  }
+
   const { rows: buyerRows } = await db.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
   const buyer = buyerRows[0];
 
@@ -149,14 +171,6 @@ router.post('/', auth, validate.order, async (req, res) => {
   if (quantity < moq) {
     return err(res, 400, `Minimum order is ${moq} units`, 'below_moq');
   }
-
-  const { rows: bRows } = await db.query(
-    'SELECT id, name, email, stellar_public_key, stellar_secret_key, referred_by, referral_bonus_sent FROM users WHERE id = $1',
-    [req.user.id]
-  );
-
-  // buyer already fetched above; use bRows for the more detailed version
-  const buyerDetailed = bRows[0] || buyer;
 
   let subtotal;
   if (product.pricing_type === 'weight') {
@@ -186,13 +200,11 @@ router.post('/', auth, validate.order, async (req, res) => {
       ? parseFloat((subtotal * appliedCoupon.discount_value / 100).toFixed(7))
       : Math.min(parseFloat(appliedCoupon.discount_value), subtotal);
   }
-  // 2. Validate Pricing & Calculate Total
-  let unitPrice = 0;
+  // 2. Validate Pricing (PWYW / donation)
   if (product.pricing_model === 'pwyw') {
     if (!custom_price || custom_price < product.min_price) {
       return err(res, 422, `Offered price is below the minimum of ${product.min_price} XLM`, 'below_min_price');
     }
-    unitPrice = parseFloat(custom_price);
   } else if (product.pricing_model === 'donation') {
     if (!custom_price || custom_price <= 0) {
       return err(res, 400, 'Donation amount must be positive', 'validation_error');
@@ -333,7 +345,7 @@ router.post('/', auth, validate.order, async (req, res) => {
   );
   const orderId = orderRows[0].id;
 
-  if (payment_method === 'sep7') {
+  if (req.body.payment_method === 'sep7') {
     if (appliedCoupon) {
       db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(appliedCoupon.id);
       db.prepare('INSERT INTO coupon_uses (coupon_id, user_id) VALUES (?, ?)').run(appliedCoupon.id, req.user.id);
@@ -708,7 +720,6 @@ router.patch('/:id/status', auth, validate.updateOrderStatus, async (req, res) =
     title: 'Order status updated',
     body: `Order #${order.id} is now ${status}`,
     url: '/orders',
-  }).catch((pushErr) => console.error('Push notification failed:', pushErr.message));
   }).catch((pushErr) => logger.error('Push notification failed:', { error: pushErr.message }));
 
   res.json({ success: true, message: 'Order status updated' });
@@ -785,13 +796,10 @@ router.post('/:id/refund', auth, async (req, res) => {
   try {
     const result = await invokeEscrowContract({ action: 'refund', senderSecret: uRows[0].stellar_secret_key, orderId: Number(order.id) });
     await db.query('UPDATE orders SET escrow_status = $1, stellar_tx_hash = $2 WHERE id = $3', ['refunded', result.txHash, order.id]);
-    res.json({ success: true, txHash: result.txHash });
-  } catch (e) { res.status(402).json({ success: false, message: e.message }); }
     return res.json({ success: true, txHash: result.txHash });
   } catch (e) {
     return res.status(402).json({ success: false, message: 'Refund failed: ' + e.message, code: 'refund_failed' });
   }
-  res.json({ success: true, data, total, page, limit });
 });
 
 // GET /api/orders/sales - farmer's incoming orders
