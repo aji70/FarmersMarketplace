@@ -26,7 +26,7 @@ const { sendPushToUser } = require('../utils/pushNotifications');
 const { err } = require('../middleware/error');
 const { getCachedResponse, cacheResponse } = require('../utils/idempotency');
 const { resolveCoupon, calcDiscount } = require('./coupons');
-const { checkGeoFence } = require('../utils/geocheck');
+const { checkGeoFence, checkCoordinateGeoFence } = require('../utils/geocheck');
 const { broadcastStockUpdate } = require('./products');
 
 // XLM per kg per km
@@ -54,10 +54,181 @@ router.post('/', auth, async (req, res) => {
   if (req.user.role !== 'buyer')
     return res.status(403).json({ error: 'Only buyers can place orders' });
 
+function isFlashSaleActive(product) {
+  if (!product?.flash_sale_price || !product?.flash_sale_ends_at) return false;
+  const now = Date.now();
+  const endsAt = new Date(product.flash_sale_ends_at).getTime();
+  if (endsAt <= now) return false;
+  if (product.flash_sale_starts_at) {
+    const startsAt = new Date(product.flash_sale_starts_at).getTime();
+    if (startsAt > now) return false;
+  }
+  return true;
+}
   const { product_id, quantity, delivery_lat, delivery_lng } = req.body;
   if (!product_id || !quantity)
     return res.status(400).json({ error: 'product_id and quantity required' });
 
+async function getEffectiveUnitPrice(product, productId, quantity) {
+  if (isFlashSaleActive(product)) return Number(product.flash_sale_price);
+  return getTierPrice(productId, quantity);
+}
+
+// GET /api/orders/fee-preview
+// GET /api/orders/fee-preview?amount=X — returns fee breakdown for a given amount
+router.get('/fee-preview', (req, res) => {
+  const amount = parseFloat(req.query.amount);
+  if (!amount || amount <= 0) return res.status(400).json({ error: 'amount is required' });
+  const info = getPlatformFeeInfo(amount);
+  res.json({ success: true, total: amount, ...info });
+});
+
+/**
+ * @swagger
+ * tags:
+ *   name: Orders
+ *   description: Order placement and management
+ */
+
+// POST /api/orders
+/**
+ * @swagger
+ * /api/orders:
+ *   post:
+ *     summary: Place and pay for an order (buyer only)
+ *     tags: [Orders]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post('/', auth, validate.order, async (req, res) => {
+  if (req.user.role !== 'buyer') return err(res, 403, 'Only buyers can place orders', 'forbidden');
+
+  const { product_id, quantity, address_id, coupon_code, use_soroban_escrow, custom_price, weight, source_asset } = req.body;
+  const idempotencyKey = req.headers['x-idempotency-key'];
+
+  if (idempotencyKey) {
+    const cached = getCachedResponse(idempotencyKey);
+    if (cached) return res.status(cached.success ? 200 : 402).json(cached);
+    if (cached) return res.json(cached);
+  }
+
+  if (address_id) {
+    const { rows: addrRows } = await db.query('SELECT * FROM addresses WHERE id = $1 AND user_id = $2', [address_id, req.user.id]);
+    if (!addrRows[0]) return err(res, 400, 'Invalid address_id', 'validation_error');
+  }
+
+  // 1. Fetch Product & Buyer
+  const { rows: prodRows } = await db.query(
+    `SELECT p.*, u.stellar_public_key as farmer_wallet, u.id as farmer_id FROM products p JOIN users u ON p.farmer_id = u.id WHERE p.id = $1`,
+    [product_id]
+  );
+  const product = prodRows[0];
+  if (!product) return err(res, 404, 'Product not found', 'not_found');
+
+  // Flash sale time window validation (server time is the source of truth)
+  if (product.flash_sale_price && product.flash_sale_ends_at) {
+    const now = Date.now();
+    if (product.flash_sale_starts_at && new Date(product.flash_sale_starts_at).getTime() > now) {
+      return err(res, 422, 'Flash sale has not started yet', 'flash_sale_not_started');
+    }
+    if (new Date(product.flash_sale_ends_at).getTime() <= now) {
+      return err(res, 422, 'Flash sale has ended', 'flash_sale_ended');
+    }
+  }
+
+  const { rows: buyerRows } = await db.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+  const buyer = buyerRows[0];
+
+  // Geo-fence check
+  // Use req.ip which respects app.set('trust proxy') configuration
+  const clientIp = req.ip || req.socket?.remoteAddress || '';
+  const { allowed: geoAllowed } = await checkGeoFence(product, buyer, clientIp);
+  if (!geoAllowed) return err(res, 403, 'Not available in your region', 'region_restricted');
+
+  // Coordinate-based geo-fence check (server-side, cannot be bypassed by client)
+  const { delivery_lat, delivery_lng } = req.body;
+  const coordFence = checkCoordinateGeoFence(product, delivery_lat, delivery_lng);
+  if (!coordFence.allowed) {
+    return err(res, 403, 'Delivery location is outside the permitted area for this product', 'outside_delivery_area');
+  }
+
+  const parsedWeight = req.body.weight ? parseFloat(req.body.weight) : (weight ? parseFloat(weight) : null);
+  if (product.pricing_type === 'weight') {
+    if (!parsedWeight || isNaN(parsedWeight) || parsedWeight <= 0) return err(res, 400, 'weight is required for weight-based products', 'validation_error');
+    if (parsedWeight < product.min_weight) return err(res, 400, `weight must be at least ${product.min_weight} ${product.unit}`, 'validation_error');
+    if (parsedWeight > product.max_weight) return err(res, 400, `weight cannot exceed ${product.max_weight} ${product.unit}`, 'validation_error');
+  }
+
+  // MOQ validation
+  const moq = product.min_order_quantity || 1;
+  if (quantity < moq) {
+    return err(res, 400, `Minimum order is ${moq} units`, 'below_moq');
+  }
+
+  let subtotal;
+  if (product.pricing_type === 'weight') {
+    subtotal = Number(product.price) * parsedWeight;
+  } else {
+    const unitPrice = await getEffectiveUnitPrice(product, product_id, quantity);
+    subtotal = unitPrice * quantity;
+  }
+  let discount = 0;
+  let appliedCoupon = null;
+  if (coupon_code) {
+    const { rows: cRows } = await db.query(
+      `SELECT * FROM coupons WHERE code = $1 AND farmer_id = $2 AND (expires_at IS NULL OR expires_at > NOW()) AND (max_uses IS NULL OR used_count < max_uses)`,
+      [coupon_code.trim().toUpperCase(), product.farmer_id]
+    );
+    if (!cRows[0]) return err(res, 400, 'Invalid or expired coupon', 'invalid_coupon');
+    appliedCoupon = cRows[0];
+    if (appliedCoupon.max_uses_per_user != null) {
+      const { rows: useRows } = await db.query(
+        'SELECT COUNT(*) as cnt FROM coupon_uses WHERE coupon_id = $1 AND user_id = $2',
+        [appliedCoupon.id, req.user.id]
+      );
+      if (parseInt(useRows[0].cnt, 10) >= appliedCoupon.max_uses_per_user)
+        return err(res, 409, 'Coupon already used', 'coupon_already_used');
+    }
+    discount = appliedCoupon.discount_type === 'percent'
+      ? parseFloat((subtotal * appliedCoupon.discount_value / 100).toFixed(7))
+      : Math.min(parseFloat(appliedCoupon.discount_value), subtotal);
+  }
+  // 2. Validate Pricing (PWYW / donation)
+  if (product.pricing_model === 'pwyw') {
+    if (!custom_price || custom_price < product.min_price) {
+      return err(res, 422, `Offered price is below the minimum of ${product.min_price} XLM`, 'below_min_price');
+    }
+  } else if (product.pricing_model === 'donation') {
+    if (!custom_price || custom_price <= 0) {
+      return err(res, 400, 'Donation amount must be positive', 'validation_error');
+    }
+    unitPrice = parseFloat(custom_price);
+  } else if (product.pricing_type === 'weight') {
+    if (!weight) return err(res, 400, 'Weight is required', 'validation_error');
+    unitPrice = product.price; // Price is per unit of weight
+  } else {
+    unitPrice = await getEffectiveUnitPrice(product, product_id, quantity);
+  }
+
+  const subtotal = product.pricing_type === 'weight' ? unitPrice * weight : unitPrice * quantity;
+  let discount = 0;
+  let appliedCoupon = null;
+
+  if (coupon_code && product.pricing_model === 'fixed') { // Coupons usually apply to fixed price
+    const result = await db.query('SELECT * FROM coupons WHERE code = $1 AND farmer_id = $2', [coupon_code, product.farmer_id]);
+    if (result.rows[0]) {
+      appliedCoupon = result.rows[0];
+      discount = calcDiscount(appliedCoupon, subtotal);
+  const { rows: buyerRows } = await db.query(
+    'SELECT id, name, email, stellar_public_key, stellar_secret_key, referred_by, referral_bonus_sent FROM users WHERE id = $1',
+    [req.user.id]
+  );
+  const buyer = buyerRows[0];
+
+  const unitPrice = await getEffectiveUnitPrice(product, product_id, quantity);
+  const subtotal = unitPrice * quantity;
+  let discount = 0;
+  let appliedCoupon = null;
   const product = db.prepare(`
     SELECT p.*, u.stellar_public_key AS farmer_wallet, u.farm_lat, u.farm_lng
     FROM products p JOIN users u ON p.farmer_id = u.id
@@ -147,7 +318,7 @@ router.post('/', auth, async (req, res) => {
   );
   const orderId = orderRows[0].id;
 
-  if (payment_method === 'sep7') {
+  if (req.body.payment_method === 'sep7') {
     if (appliedCoupon) {
       db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(appliedCoupon.id);
       db.prepare('INSERT INTO coupon_uses (coupon_id, user_id) VALUES (?, ?)').run(appliedCoupon.id, req.user.id);
@@ -494,6 +665,9 @@ router.patch('/:id/status', auth, validate.updateOrderStatus, async (req, res) =
 
   await db.query('UPDATE orders SET status = $1 WHERE id = $2', [status, order.id]);
 
+  // Broadcast real-time status update to SSE clients
+  broadcastOrderUpdate(order.buyer_id, order.id, status);
+
   sendStatusUpdateEmail({
     order,
     product: { name: order.product_name, unit: order.unit },
@@ -585,7 +759,73 @@ router.post('/:id/refund', auth, async (req, res) => {
     await db.query('UPDATE orders SET escrow_status = $1, stellar_tx_hash = $2 WHERE id = $3', ['refunded', result.txHash, order.id]);
     res.json({ success: true, txHash: result.txHash });
   } catch (e) { res.status(402).json({ success: false, message: e.message }); }
+    return res.json({ success: true, txHash: result.txHash });
+  } catch (e) {
+    return res.status(402).json({ success: false, message: 'Refund failed: ' + e.message, code: 'refund_failed' });
+  }
+});
+
+// GET /api/orders/sales - farmer's incoming orders
+router.get('/sales', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Farmers only' });
+
+  const sales = db.prepare(`
+    SELECT o.*, p.name AS product_name, u.name AS buyer_name
+    FROM orders o
+    JOIN products p ON o.product_id = p.id
+    JOIN users u ON o.buyer_id = u.id
+    WHERE p.farmer_id = ?
+    ORDER BY o.created_at DESC
+  `).all(req.user.id);
+  res.json(sales);
+});
+
+// SSE clients map: userId -> Set of response objects
+const orderClients = new Map();
+
+function broadcastOrderUpdate(userId, orderId, status) {
+  const clients = orderClients.get(userId);
+  if (!clients) return;
+  const payload = `data: ${JSON.stringify({ id: orderId, status })}\n\n`;
+  for (const res of clients) {
+    try { res.write(payload); } catch { /* ignore */ }
+  }
+}
+
+// GET /api/orders/stream — SSE endpoint for real-time order status updates
+// Auth via ?token= query param (EventSource cannot set headers)
+const jwt = require('jsonwebtoken');
+router.get('/stream', async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(401).json({ error: 'No token' });
+  let user;
+  try {
+    user = jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  if (!orderClients.has(user.id)) orderClients.set(user.id, new Set());
+  orderClients.get(user.id).add(res);
+
+  const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* ignore */ } }, 30000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const clients = orderClients.get(user.id);
+    if (clients) {
+      clients.delete(res);
+      if (clients.size === 0) orderClients.delete(user.id);
+    }
+  });
 });
 
 module.exports = router;
+module.exports.broadcastOrderUpdate = broadcastOrderUpdate;
 

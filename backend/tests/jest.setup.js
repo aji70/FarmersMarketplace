@@ -102,6 +102,7 @@ jest.mock('../src/routes', () => {
   router.use('/api/orders', require('../src/routes/orders'));
   router.use('/api/orders/:id/return', require('../src/routes/returns'));
   router.use('/api/analytics', require('../src/routes/analytics'));
+  router.use('/api/orders', require('../src/routes/orders'));
   return router;
 });
 

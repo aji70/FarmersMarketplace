@@ -60,12 +60,31 @@ const s = {
   empty:      { color: '#aaa', fontSize: 14, textAlign: 'center', padding: '24px 0' },
   badge:      { display: 'inline-block', fontSize: 11, borderRadius: 4, padding: '2px 7px' },
   select:     { width: '100%', padding: '9px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, marginBottom: 12 },
-  galleryMain:   { width: '100%', maxHeight: 320, objectFit: 'cover', borderRadius: 10, marginBottom: 10, display: 'block' },
+  galleryMain:   { width: '100%', maxHeight: 320, objectFit: 'cover', borderRadius: 10, marginBottom: 10, display: 'block', transition: 'transform 0.3s ease' },
+  galleryMainContainer: { overflow: 'hidden', borderRadius: 10, marginBottom: 10, cursor: 'zoom-in' },
   thumbRow:      { display: 'flex', gap: 8, marginBottom: 16, overflowX: 'auto' },
   thumb:         { width: 64, height: 64, objectFit: 'cover', borderRadius: 6, cursor: 'pointer', border: '2px solid transparent', flexShrink: 0 },
   thumbActive:   { border: '2px solid #2d6a4f' },
   navBtn:        { background: 'rgba(0,0,0,0.35)', color: '#fff', border: 'none', borderRadius: '50%', width: 32, height: 32, cursor: 'pointer', fontSize: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' },
 };
+
+function CopyButton({ url }) {
+  const [copied, setCopied] = useState(false);
+  function handleCopy() {
+    navigator.clipboard.writeText(url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+  return (
+    <button
+      style={{ ...{ background: '#2d6a4f', color: '#fff', border: 'none', borderRadius: 8, padding: '9px 20px', cursor: 'pointer', fontWeight: 600, fontSize: 14, width: '100%' } }}
+      onClick={handleCopy}
+    >
+      {copied ? 'Copied!' : 'Copy link'}
+    </button>
+  );
+}
 
 export default function ProductDetail() {
   const { t } = useTranslation();
@@ -568,7 +587,11 @@ export default function ProductDetail() {
         {images.length > 0 ? (
           <div style={{ marginBottom: 16 }}>
             <div style={{ position: 'relative' }}>
-              <img src={images[safeActiveImg].url} alt={`${product.name} photo ${safeActiveImg + 1}`} style={s.galleryMain} />
+              <div style={s.galleryMainContainer}
+                onMouseEnter={e => e.currentTarget.querySelector('img').style.transform = 'scale(1.35)'}
+                onMouseLeave={e => e.currentTarget.querySelector('img').style.transform = ''}>
+                <img src={images[safeActiveImg].url} alt={`${product.name} photo ${safeActiveImg + 1}`} style={s.galleryMain} />
+              </div>
               {images.length > 1 && (
                 <div style={{ position: 'absolute', top: '50%', transform: 'translateY(-50%)', width: '100%', display: 'flex', justifyContent: 'space-between', padding: '0 8px', boxSizing: 'border-box', pointerEvents: 'none' }}>
                   <button style={{ ...s.navBtn, pointerEvents: 'all' }} onClick={() => setActiveImg(i => (i - 1 + images.length) % images.length)} aria-label={t('productDetail.previousImage')}>‹</button>
@@ -1080,24 +1103,20 @@ export default function ProductDetail() {
             </button>
             {paymentLinkError && <div style={{ ...s.err, marginTop: 8 }}>{paymentLinkError}</div>}
             {paymentLinkData && (
-              <div style={{ marginTop: 16, padding: 12, border: '1px solid #ddd', borderRadius: 8, background: '#f9fff9' }}>
-                <div style={{ marginBottom: 8, fontWeight: 600 }}>SEP-0007 Payment Link</div>
-                <a href={paymentLinkData.paymentLink} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all', color: '#1b4332' }}>
-                  {paymentLinkData.paymentLink}
-                </a>
-                <div style={{ marginTop: 8, fontSize: 12, color: '#555' }}>
-                  Expires at: {new Date(paymentLinkData.expiresAt).toLocaleString()}
+              <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+                <div style={{ background: '#fff', borderRadius: 12, padding: 24, maxWidth: 360, width: '90%', boxShadow: '0 4px 24px #0003' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                    <div style={{ fontWeight: 700, fontSize: 16, color: '#2d6a4f' }}>SEP-0007 Payment Link</div>
+                    <button onClick={() => setPaymentLinkData(null)} style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', color: '#888' }} aria-label="Close">✕</button>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 16 }}>
+                    <QRCode value={paymentLinkData.paymentLink} size={200} />
+                  </div>
+                  <CopyButton url={paymentLinkData.paymentLink} />
+                  <div style={{ marginTop: 8, fontSize: 12, color: '#888', textAlign: 'center' }}>
+                    Expires: {new Date(paymentLinkData.expiresAt).toLocaleString()}
+                  </div>
                 </div>
-                <div style={{ marginTop: 12 }}>
-                  <img
-                    src={api.getOrderPaymentLinkQr(paymentLinkData.orderId)}
-                    alt="Payment link QR"
-                    style={{ width: 220, height: 220, borderRadius: 10, border: '1px solid #e0e0e0' }}
-                  />
-                </div>
-                <button style={{ ...s.btnSm, marginTop: 8 }} onClick={() => navigator.clipboard.writeText(paymentLinkData.paymentLink)}>
-                  Copy payment link
-                </button>
               </div>
             )}
             <style>{`@keyframes spin { to { transform: rotate(360deg); } } .spinner-sm { display: inline-block; }`}</style>
